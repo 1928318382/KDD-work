@@ -15,10 +15,10 @@ DATA_FILES = {
 }
 
 # 训练（聚类/建模）使用哪个数据集：只允许 "merged" 或 "all"
-TRAIN_DATASET = "merged"   # 可改成 "all"
+TRAIN_DATASET = "normal"   # 可改成 "all"
 
 # 测试/评估使用哪个数据集：一般用 "merged" 或 "all"
-TEST_DATASET = "merged"
+TEST_DATASET = "all"
 
 # 标签列名（如果没有这一列，会尝试把“最后一列”当作 label）
 LABEL_COL = "label"
@@ -52,9 +52,9 @@ PREVIEW_ROWS = 20000      # 额外保存一份前 N 行预览（便于快速看�
 ENABLE_VIS = True
 
 # 可视化采样点数（数据很大时只抽样画图，不然会非常慢）
-VIS_SAMPLE_SIZE = 5000
-VIS_RANDOM_STATE = 42
-VIS_FIG_DPI = 180
+VIS_SAMPLE_SIZE = 10000
+VIS_RANDOM_STATE = 420
+VIS_FIG_DPI = 1800
 
 # ============================================================
 # ⑤ KMeans 参数
@@ -75,7 +75,7 @@ KMEANS = {
 # ============================================================
 DBSCAN = {
     # DBSCAN 本身很慢：只用训练数据的前 train_rows 行拟合（可调大/调小）
-    "train_rows": 200000,
+    "train_rows": 2000000,
 
     "min_samples": 30,
 

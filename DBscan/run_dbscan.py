@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 import config
 import utils
 import visualization as vis
-
+device='cuda'
 
 def estimate_eps_knn(X: np.ndarray, k: int, quantile: float) -> float:
     nn = NearestNeighbors(n_neighbors=max(2, k), algorithm="auto")

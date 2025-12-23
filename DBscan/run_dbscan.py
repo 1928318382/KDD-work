@@ -21,12 +21,28 @@ import utils
 import visualization as vis
 device='cuda'
 
+
 def estimate_eps_knn(X: np.ndarray, k: int, quantile: float) -> float:
     nn = NearestNeighbors(n_neighbors=max(2, k), algorithm="auto")
     nn.fit(X)
     dists, _ = nn.kneighbors(X, return_distance=True)
     kth = dists[:, -1]
-    return float(np.quantile(kth, quantile))
+
+    # === 算法优化：使用更鲁棒的统计边界 ===
+    mean_dist = np.mean(kth)
+    std_dist = np.std(kth)
+    max_dist = np.max(kth)
+
+    # 策略 A: 均值 + 3倍标准差 (覆盖 99.7% 的正态分布，且能适应长尾)
+    # 这种方式比硬性的 quantile 更能适应数据的离散程度
+    eps_robust = mean_dist + 3 * std_dist
+
+    print(f"[Auto-Eps] Mean: {mean_dist:.4f}, Std: {std_dist:.4f}, Max: {max_dist:.4f}")
+    print(f"[Auto-Eps] 建议阈值 (Mean+3Std): {eps_robust:.4f}")
+
+    # 如果训练数据非常纯净，甚至可以直接使用 max_dist * 1.05
+    # 这里我们返回 robust 值，并确保不小于原来的 quantile 逻辑
+    return float(max(eps_robust, np.quantile(kth, quantile)))
 
 
 def main() -> None:
@@ -53,12 +69,18 @@ def main() -> None:
     train_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
     test_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
 
-    # 1) 读取训练子集（DBSCAN 很慢，建议只取前 train_rows 行）
-    if train_rows > 0:
-        df_train = pd.read_csv(train_path, nrows=train_rows)
-    else:
-        df_train = pd.read_csv(train_path)
+    # 1) 读取训练子集（修改为：随机采样，而非截取头部）
+    print(f"正在读取训练数据: {train_path} ...")
+    # 先读取完整数据（SWaT数据量不大，内存通常足够）
+    df_full = pd.read_csv(train_path)
 
+    if train_rows > 0 and train_rows < len(df_full):
+        # 核心修改：使用 sample 进行随机抽样，随机种子保证复现
+        df_train = df_full.sample(n=train_rows, random_state=42).reset_index(drop=True)
+        print(f"已随机采样 {train_rows} 行用于 DBSCAN 训练。")
+    else:
+        df_train = df_full
+        print(f"使用全量数据 {len(df_train)} 行用于 DBSCAN 训练。")
     X_df, _, _ = utils.split_X_y(df_train, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
     X_df = train_imputer.transform(X_df)
     X_train = X_df.to_numpy(dtype=np.float32, copy=False)

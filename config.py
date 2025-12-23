@@ -74,17 +74,20 @@ KMEANS = {
 # ⑥ DBSCAN 参数
 # ============================================================
 DBSCAN = {
-    # DBSCAN 本身很慢：只用训练数据的前 train_rows 行拟合（可调大/调小）
-    "train_rows": 2000000,
+    # 保持采样行数
+    "train_rows": 100000,
 
-    "min_samples": 30,
+    # 稍微增加 min_samples，过滤掉训练集中的个别噪点
+    "min_samples": 50,
 
-    # eps <= 0 表示自动估计 eps（kNN 距离分位数）
-    "eps": 0.0,
-    "eps_quantile": 0.98,
+    # 【重要】
+    # 设置为 -1.0 以启用我们在 run_dbscan.py 中新写的自动估计逻辑 (Mean+3Std)
+    # 或者，如果你想手动控制，根据之前的 score 分布，建议直接给 3.5
+    "eps": 3.5,
 
-    # DBSCAN 前可先 PCA 降维（建议 10~20）
+    # 只有当 eps <= 0 时，下面的参数才生效 (现在用上面的 3.5 覆盖)
+    "eps_quantile": 0.9999,
+
     "pca_components": 15,
-
-    "test_chunksize": 200000,
+    "test_chunksize": 100000,
 }

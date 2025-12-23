@@ -1,23 +1,15 @@
-# DBSCAN Unsupervised Anomaly Detection (Scalable Scoring)
+# DBSCAN 无监督异常检测
 
-## Idea
-Fit DBSCAN on a subset of training data (features only, no labels).
-Use DBSCAN core samples as the "normal dense region".
+## 原理（工程可扩展版本）
+- 用训练数据拟合 DBSCAN，得到核心点（core samples）
+- 异常评分：样本到“最近核心点”的距离
+- 异常判定：score > eps => y_pred=1
+- eps 可自动估计：kNN 距离的分位数（config.py -> eps_quantile）
 
-Anomaly score for any x:
-- score(x) = distance(x, nearest core sample)
+## 训练数据
+由 config.py 控制：
+- TRAIN_DATASET = "merged" 或 "all"
 
-Decision rule:
-- y_pred = 1 if score(x) > eps else 0
-
-This makes it possible to score very large test sets in chunks.
-
-## Example
+## 运行
 ```bash
-python run_dbscan.py \
-  --train_path data/swat_clean_normal.csv \
-  --test_path data/swat_clean_merged.csv \
-  --train_rows 200000 \
-  --min_samples 30 \
-  --eps_quantile 0.98 \
-  --pca_components 15
+python run_dbscan.py

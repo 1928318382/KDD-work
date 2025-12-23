@@ -1,23 +1,17 @@
-# Unsupervised Anomaly Detection (SWaT)
+# 无监督异常检测（第一版：带评估指标）
 
-## Requirements satisfied
-- Implements 2 unsupervised anomaly detection methods:
-  1) KMeans distance-to-centroid scoring
-  2) DBSCAN + nearest-core distance scoring
-- Does NOT use labels to train models:
-  - Any `label` column is dropped before training & scoring.
-- Outputs anomaly score and anomaly decision:
-  - `score` (continuous)
-  - `y_pred` (0/1)
+## 目标
+- 实现 2 种无监督异常检测方法：KMeans、DBSCAN
+- **训练阶段不使用 label**（只用特征）
+- 输出异常评分 score / 异常判定 y_pred
+- 同时（可选）使用 label 在测试阶段计算 Accuracy / Precision / Recall / F1（仅评估，不参与训练）
 
-## Data format
-Input CSV is expected to contain only numeric feature columns.
-If a `label` column exists (or you specify `--label_col`), it will be ignored (dropped).
+## 关键改动
+1. 训练数据不再使用 normal，而是使用 **merged 或 all**  
+2. 运行不带任何路径参数：直接运行脚本  
+3. 增加可视化模块：开启后自动生成聚类与异常分布图表  
+4. 所有路径与参数集中在 `config.py` 统一配置
 
-Recommended (from your preprocessing):
-- swat_clean_normal.csv
-- swat_clean_merged.csv
-
-## Install
+## 环境安装
 ```bash
 pip install -r requirements.txt

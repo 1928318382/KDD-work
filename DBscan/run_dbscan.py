@@ -1,10 +1,9 @@
+from __future__ import annotations
 
-import argparse
 import csv
 import json
-import os
-from dataclasses import asdict, dataclass
-from typing import Optional
+from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
@@ -13,54 +12,16 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-@dataclass
-class ModelInfo:
-    method: str
-    eps: float
-    min_samples: int
-    eps_estimated: bool
-    eps_quantile: float
-    standardize: bool
-    pca_components: int
-    impute: str
-    constant_value: float
-    train_path: str
-    test_path: str
-    train_rows: int
-    test_chunksize: int
-    n_core_samples: int
-    n_clusters_found: int
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def drop_label(df: pd.DataFrame, label_col: str) -> pd.DataFrame:
-    """Drop label column if exists. This ensures NO label is used in training/scoring."""
-    if label_col and label_col in df.columns:
-        return df.drop(columns=[label_col])
-    return df
-
-
-def impute_df(df: pd.DataFrame, strategy: str, constant_value: float) -> pd.DataFrame:
-    df = df.copy()
-    if strategy == "none":
-        return df
-    if strategy == "ffill_bfill":
-        return df.ffill().bfill()
-    if strategy == "constant":
-        return df.fillna(constant_value)
-    raise ValueError(f"Unknown impute strategy: {strategy}")
+import config
+import utils
+import visualization as vis
 
 
 def estimate_eps_knn(X: np.ndarray, k: int, quantile: float) -> float:
-    """
-    Estimate eps using k-NN distances:
-    - compute distance to k-th nearest neighbor for each point
-    - eps = quantile of those distances
-    """
     nn = NearestNeighbors(n_neighbors=max(2, k), algorithm="auto")
     nn.fit(X)
     dists, _ = nn.kneighbors(X, return_distance=True)
@@ -68,94 +29,107 @@ def estimate_eps_knn(X: np.ndarray, k: int, quantile: float) -> float:
     return float(np.quantile(kth, quantile))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train_path", required=True, help="Training CSV (features only; label will be dropped if exists).")
-    ap.add_argument("--test_path", default="", help="Test CSV. If empty, score train_path.")
-    ap.add_argument("--label_col", default="label", help="Label column name to drop (ignored during training).")
+def main() -> None:
+    train_path = config.DATA_DIR / config.DATA_FILES[config.TRAIN_DATASET]
+    test_path = config.DATA_DIR / config.DATA_FILES[config.TEST_DATASET]
 
-    ap.add_argument("--train_rows", type=int, default=200000, help="Rows used to fit DBSCAN (head). 0 means all (may be slow).")
-    ap.add_argument("--min_samples", type=int, default=30)
-    ap.add_argument("--eps", type=float, default=0.0, help="If >0, use directly; else estimate via kNN quantile.")
-    ap.add_argument("--eps_quantile", type=float, default=0.98)
+    if not train_path.exists():
+        raise FileNotFoundError(f"找不到训练文件: {train_path}")
+    if not test_path.exists():
+        raise FileNotFoundError(f"找不到测试文件: {test_path}")
 
-    ap.add_argument("--standardize", action="store_true", help="Fit StandardScaler on train and apply to both train/test.")
-    ap.add_argument("--pca_components", type=int, default=15, help="0 to disable PCA.")
+    out_dir = Path(__file__).resolve().parent / "outputs"
+    plots_dir = out_dir / "plots"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    ap.add_argument("--impute", choices=["none", "ffill_bfill", "constant"], default="ffill_bfill")
-    ap.add_argument("--constant_value", type=float, default=-1.0)
+    db_cfg = config.DBSCAN
+    train_rows = int(db_cfg["train_rows"])
+    min_samples = int(db_cfg["min_samples"])
+    eps = float(db_cfg["eps"])
+    eps_quantile = float(db_cfg["eps_quantile"])
+    pca_components = int(db_cfg["pca_components"])
+    test_chunksize = int(db_cfg["test_chunksize"])
 
-    ap.add_argument("--test_chunksize", type=int, default=200000)
-    ap.add_argument("--outputs_dir", default=os.path.join("dbscan", "outputs"))
-    ap.add_argument("--output_csv", default="dbscan_results.csv")
-    ap.add_argument("--model_info_json", default="model_info.json")
-    args = ap.parse_args()
+    train_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
+    test_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
 
-    ensure_dir(args.outputs_dir)
-
-    test_path = args.test_path if args.test_path else args.train_path
-
-    # 1) Load train subset
-    if args.train_rows and args.train_rows > 0:
-        train_df = pd.read_csv(args.train_path, nrows=args.train_rows)
+    # 1) 读取训练子集（DBSCAN 很慢，建议只取前 train_rows 行）
+    if train_rows > 0:
+        df_train = pd.read_csv(train_path, nrows=train_rows)
     else:
-        train_df = pd.read_csv(args.train_path)
+        df_train = pd.read_csv(train_path)
 
-    X_train_df = drop_label(train_df, args.label_col)
-    X_train_df = impute_df(X_train_df, args.impute, args.constant_value)
-    X_train = X_train_df.to_numpy(dtype=np.float32, copy=False)
+    X_df, _, _ = utils.split_X_y(df_train, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+    X_df = train_imputer.transform(X_df)
+    X_train = X_df.to_numpy(dtype=np.float32, copy=False)
 
-    # 2) Optional standardize
-    scaler: Optional[StandardScaler] = None
-    if args.standardize:
+    scaler = None
+    if config.STANDARDIZE:
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train)
 
-    # 3) Optional PCA
-    pca: Optional[PCA] = None
-    pca_components = int(args.pca_components)
+    pca = None
     if pca_components and pca_components > 0:
         pca = PCA(n_components=pca_components, random_state=42)
         X_train = pca.fit_transform(X_train)
 
-    # 4) eps
+    # 2) eps 自动估计（可选）
     eps_estimated = False
-    eps = float(args.eps)
     if eps <= 0:
-        eps = estimate_eps_knn(X_train, k=args.min_samples, quantile=args.eps_quantile)
+        eps = estimate_eps_knn(X_train, k=min_samples, quantile=eps_quantile)
         eps_estimated = True
 
-    # 5) Fit DBSCAN
-    db = DBSCAN(eps=eps, min_samples=args.min_samples, n_jobs=-1)
+    # 3) 拟合 DBSCAN（无监督：不使用 label）
+    db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
     db.fit(X_train)
 
     core_idx = getattr(db, "core_sample_indices_", None)
     if core_idx is None or len(core_idx) == 0:
-        raise RuntimeError("DBSCAN produced zero core samples. Try increasing eps or decreasing min_samples.")
+        raise RuntimeError("DBSCAN 没有产生核心点，请尝试增大 eps 或减小 min_samples。")
 
     core_X = X_train[core_idx]
 
-    # number of clusters found (excluding noise -1)
-    labels = db.labels_
-    uniq = set(int(x) for x in np.unique(labels))
+    # 聚类数（不含噪声 -1）
+    uniq = set(int(x) for x in np.unique(db.labels_))
     n_clusters = len([u for u in uniq if u != -1])
 
-    # 6) Build 1-NN index on core samples for scoring
+    # 4) 用核心点建立 1-NN，用于测试集打分（可扩展）
     core_nn = NearestNeighbors(n_neighbors=1, algorithm="auto")
     core_nn.fit(core_X)
 
-    # 7) Score test in chunks, write results
-    out_path = os.path.join(args.outputs_dir, args.output_csv)
-    header = ["row_id", "score", "y_pred"]
+    results_path = out_dir / "dbscan_results.csv"
+    preview_path = out_dir / "scores_preview.csv"
+    metrics_path = out_dir / "metrics.json"
+    confusion_path = out_dir / "confusion.json"
+    model_info_path = out_dir / "model_info.json"
+
+    confusion = utils.Confusion()
+    has_label_any = False
+
+    # 可视化采样
+    vis_train_take = config.VIS_SAMPLE_SIZE
+    X_train_vis = X_train[:min(vis_train_take, X_train.shape[0])]
+    y_train_vis = db.labels_[:X_train_vis.shape[0]]
+
+    vis_test_X = []
+    vis_test_pred = []
+    vis_test_score = []
+
+    preview_rows = int(config.PREVIEW_ROWS)
+    preview_written = 0
 
     row_id = 0
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
+    with open(results_path, "w", newline="", encoding="utf-8") as f_res, \
+         open(preview_path, "w", newline="", encoding="utf-8") as f_pre:
 
-        for chunk in pd.read_csv(test_path, chunksize=args.test_chunksize):
-            X_df = drop_label(chunk, args.label_col)
-            X_df = impute_df(X_df, args.impute, args.constant_value)
+        w_res = csv.writer(f_res)
+        w_pre = csv.writer(f_pre)
+        w_res.writerow(["row_id", "score", "y_pred"])
+        w_pre.writerow(["row_id", "score", "y_pred"])
+
+        for chunk in utils.iter_csv_chunks(test_path, test_chunksize):
+            X_df, y, has_label = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+            X_df = test_imputer.transform(X_df)
             X = X_df.to_numpy(dtype=np.float32, copy=False)
 
             if scaler is not None:
@@ -167,35 +141,146 @@ def main():
             scores = dists[:, 0].astype(np.float32, copy=False)
             y_pred = (scores > eps).astype(np.int8)
 
-            for s, yp in zip(scores, y_pred):
-                w.writerow([row_id, float(s), int(yp)])
-                row_id += 1
+            # 保存全量
+            if config.SAVE_FULL_RESULTS:
+                for s, yp in zip(scores, y_pred):
+                    w_res.writerow([row_id, float(s), int(yp)])
+                    row_id += 1
+            else:
+                row_id += X.shape[0]
 
-    info = ModelInfo(
-        method="dbscan_nearest_core",
-        eps=float(eps),
-        min_samples=int(args.min_samples),
-        eps_estimated=bool(eps_estimated),
-        eps_quantile=float(args.eps_quantile),
-        standardize=bool(args.standardize),
-        pca_components=int(pca_components if pca_components > 0 else 0),
-        impute=args.impute,
-        constant_value=float(args.constant_value),
-        train_path=args.train_path,
-        test_path=test_path,
-        train_rows=int(args.train_rows),
-        test_chunksize=int(args.test_chunksize),
-        n_core_samples=int(len(core_X)),
-        n_clusters_found=int(n_clusters),
-    )
+            # 保存预览
+            if preview_written < preview_rows:
+                remain = preview_rows - preview_written
+                take = min(remain, X.shape[0])
+                base = row_id - X.shape[0]
+                for i in range(take):
+                    w_pre.writerow([base + i, float(scores[i]), int(y_pred[i])])
+                preview_written += take
 
-    with open(os.path.join(args.outputs_dir, args.model_info_json), "w", encoding="utf-8") as f:
-        json.dump(asdict(info), f, ensure_ascii=False, indent=2)
+            # 评估（若存在 label）
+            if has_label and y is not None:
+                has_label_any = True
+                y_true = (y == 1).astype(np.int8)
+                confusion.update(y_true, y_pred)
 
-    print("DBSCAN unsupervised anomaly detection finished.")
-    print(f"eps={eps:.6f} (estimated={eps_estimated})")
-    print("results:", out_path)
-    print("model info:", os.path.join(args.outputs_dir, args.model_info_json))
+            # 可视化采样（取前 VIS_SAMPLE_SIZE 行）
+            if config.ENABLE_VIS and len(vis_test_score) < config.VIS_SAMPLE_SIZE:
+                need = config.VIS_SAMPLE_SIZE - len(vis_test_score)
+                take = min(need, X.shape[0])
+                vis_test_X.append(X[:take])
+                vis_test_pred.append(y_pred[:take])
+                vis_test_score.append(scores[:take])
+
+    # 保存指标
+    if has_label_any:
+        m = utils.metrics_from_confusion(confusion)
+        metrics = {
+            **m,
+            "eps": eps,
+            "min_samples": min_samples,
+            "eps_estimated": eps_estimated,
+            "eps_quantile": eps_quantile,
+            "pca_components": pca_components,
+            "n_core_samples": int(len(core_X)),
+            "n_clusters_found": int(n_clusters),
+            "train_dataset": config.TRAIN_DATASET,
+            "test_dataset": config.TEST_DATASET,
+            "has_label": True,
+        }
+    else:
+        metrics = {
+            "accuracy": None,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "eps": eps,
+            "min_samples": min_samples,
+            "eps_estimated": eps_estimated,
+            "eps_quantile": eps_quantile,
+            "pca_components": pca_components,
+            "n_core_samples": int(len(core_X)),
+            "n_clusters_found": int(n_clusters),
+            "train_dataset": config.TRAIN_DATASET,
+            "test_dataset": config.TEST_DATASET,
+            "has_label": False,
+        }
+
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    with open(confusion_path, "w", encoding="utf-8") as f:
+        json.dump(confusion.to_dict(), f, ensure_ascii=False, indent=2)
+
+    model_info = {
+        "method": "dbscan_nearest_core",
+        "train_path": str(train_path),
+        "test_path": str(test_path),
+        "impute_strategy": config.IMPUTE_STRATEGY,
+        "constant_value": config.CONSTANT_VALUE,
+        "standardize": config.STANDARDIZE,
+        "train_rows": train_rows,
+        "min_samples": min_samples,
+        "eps": eps,
+        "eps_estimated": eps_estimated,
+        "eps_quantile": eps_quantile,
+        "pca_components": pca_components,
+        "n_core_samples": int(len(core_X)),
+        "n_clusters_found": int(n_clusters),
+        "labels_unique": [int(x) for x in np.unique(db.labels_)],
+    }
+    with open(model_info_path, "w", encoding="utf-8") as f:
+        json.dump(model_info, f, ensure_ascii=False, indent=2)
+
+    # 可视化
+    if config.ENABLE_VIS:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # 训练集 DBSCAN 聚类可视化（含噪声 -1）
+        vis.plot_pca_scatter(
+            X_train_vis, y_train_vis,
+            title=f"DBSCAN 训练集聚类可视化（PCA2D, sample={X_train_vis.shape[0]}）",
+            out_path=plots_dir / "train_clusters_pca.png",
+            dpi=config.VIS_FIG_DPI,
+            noise_label=-1
+        )
+
+        # 测试集异常判定可视化 + 分数分布
+        if len(vis_test_X) > 0:
+            Xte = np.vstack(vis_test_X)
+            ypred = np.concatenate(vis_test_pred)
+            sc = np.concatenate(vis_test_score)
+
+            vis.plot_pca_scatter(
+                Xte, ypred,
+                title=f"DBSCAN 测试集异常判定可视化（PCA2D, sample={Xte.shape[0]}）",
+                out_path=plots_dir / "test_pred_pca.png",
+                dpi=config.VIS_FIG_DPI
+            )
+            vis.plot_score_hist(
+                sc, eps,
+                title="DBSCAN 测试集异常评分分布（采样）",
+                out_path=plots_dir / "score_hist.png",
+                dpi=config.VIS_FIG_DPI
+            )
+
+        if has_label_any:
+            d = confusion.to_dict()
+            vis.plot_confusion_matrix(
+                tp=d["tp"], fp=d["fp"], tn=d["tn"], fn=d["fn"],
+                title="DBSCAN 混淆矩阵",
+                out_path=plots_dir / "confusion_matrix.png",
+                dpi=config.VIS_FIG_DPI
+            )
+
+    print("===== DBSCAN 完成 =====")
+    print("训练集：", train_path.name, "测试集：", test_path.name)
+    print("eps =", eps, "(estimated)" if eps_estimated else "(fixed)")
+    print("results ->", results_path)
+    print("metrics  ->", metrics_path)
+    print("confusion->", confusion_path)
+    if config.ENABLE_VIS:
+        print("plots    ->", plots_dir)
 
 
 if __name__ == "__main__":

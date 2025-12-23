@@ -1,23 +1,15 @@
+# KMeans 无监督异常检测
 
----
+## 原理
+- 用 MiniBatchKMeans 对训练数据进行聚类（训练阶段只用特征）
+- 异常评分：样本到最近簇中心的距离
+- 阈值：训练集 score 的分位数（config.py -> KMEANS.threshold_quantile）
+- 异常判定：score > threshold => y_pred=1
 
-# ✅ 1) KMeans 文件夹
+## 训练数据
+由 config.py 控制：
+- TRAIN_DATASET = "merged" 或 "all"
 
-## kmeans/README.md
-```md
-# KMeans Unsupervised Anomaly Detection
-
-## Idea
-Train MiniBatchKMeans on **features only** (no labels).
-Anomaly score = distance to nearest centroid.
-Decision rule = score > threshold.
-
-Threshold is estimated from the training-score distribution (quantile).
-
-## Example
+## 运行
 ```bash
-python run_kmeans.py \
-  --train_path data/swat_clean_normal.csv \
-  --test_path data/swat_clean_merged.csv \
-  --n_clusters 20 \
-  --threshold_quantile 0.99
+python run_kmeans.py

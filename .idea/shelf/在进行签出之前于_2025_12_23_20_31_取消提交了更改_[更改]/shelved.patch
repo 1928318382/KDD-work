@@ -1,0 +1,25 @@
+Index: supervised.py
+===================================================================
+diff --git a/supervised.py b/supervised.py
+--- a/supervised.py	(revision 6644c4e780afdf3ca79a63eb3c34fef130aa474d)
++++ b/supervised.py	(date 1766492810622)
+@@ -1,0 +1,1 @@
++1111
+\ No newline at end of file
+Index: .idea/misc.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<project version=\"4\">\r\n  <component name=\"ProjectRootManager\" version=\"2\" project-jdk-name=\"Python 3.13 (新建文件夹)\" project-jdk-type=\"Python SDK\" />\r\n</project>
+===================================================================
+diff --git a/.idea/misc.xml b/.idea/misc.xml
+--- a/.idea/misc.xml	(revision 6644c4e780afdf3ca79a63eb3c34fef130aa474d)
++++ b/.idea/misc.xml	(date 1766492928268)
+@@ -1,4 +1,7 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <project version="4">
++  <component name="Black">
++    <option name="sdkName" value="Python 3.13 (新建文件夹)" />
++  </component>
+   <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.13 (新建文件夹)" project-jdk-type="Python SDK" />
+ </project>
+\ No newline at end of file

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pandas as pd
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.preprocessing import StandardScaler
 
@@ -17,6 +18,78 @@ if str(ROOT) not in sys.path:
 import config
 import utils
 import visualization as vis
+
+
+class StreamDiff:
+    """
+    参照 DBSCAN 脚本，实现跨分块的一阶差分特征。
+    - 训练和测试都可以用该类来在流式读取时构造 diff 特征。
+    """
+
+    def __init__(self) -> None:
+        self._prev_row = None  # 记录上一块的最后一行
+
+    def transform(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        if df.empty:
+            return pd.DataFrame(
+                columns=[f"{c}_diff" for c in df.columns],
+                index=df.index,
+            )
+
+        # 块内差分
+        diff_df = df.diff()
+
+        # 第一行与上一块最后一行对齐，保证跨块连续
+        if self._prev_row is not None:
+            first_row_diff = df.iloc[0].values - self._prev_row.values
+            diff_df.iloc[0] = first_row_diff
+        else:
+            diff_df.iloc[0] = 0.0
+
+        # 更新缓存行
+        self._prev_row = df.iloc[-1].copy()
+
+        diff_df.columns = [f"{c}_diff" for c in df.columns]
+        return diff_df
+
+
+class StreamScoreSmoother:
+    """
+    参照 DBSCAN 脚本的滑动窗口平滑，对异常评分做时间窗口平均，
+    降低瞬时抖动带来的误报。
+    """
+
+    def __init__(self, window: int = 1) -> None:
+        self.window = int(window)
+        self._buffer = np.array([], dtype=np.float32)
+
+    def transform(self, scores: np.ndarray) -> np.ndarray:
+        if self.window <= 1:
+            return scores
+
+        if len(self._buffer) > 0:
+            data = np.concatenate([self._buffer, scores])
+        else:
+            data = scores
+
+        if len(data) == 0:
+            return scores
+
+        smoothed = (
+            pd.Series(data)
+            .rolling(window=self.window, min_periods=1)
+            .mean()
+            .to_numpy(dtype=np.float32)
+        )
+
+        # 只返回当前块对应的那一段
+        result = smoothed[-len(scores) :]
+
+        # 更新 buffer，保留末尾 window 个点
+        keep = min(self.window, len(data))
+        self._buffer = data[-keep:]
+
+        return result
 
 
 def main() -> None:
@@ -44,22 +117,36 @@ def main() -> None:
     train_chunksize = int(km_cfg["train_chunksize"])
     test_chunksize = int(km_cfg["test_chunksize"])
     q = float(km_cfg["threshold_quantile"])
+    smoothing_window = int(km_cfg.get("smoothing_window", 1))
 
     # 缺失值处理（分块）
     train_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
     test_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
 
-    # 可选：标准化
+    # 差分特征计算器（训练/测试各一套）
+    train_diff_for_scaler = StreamDiff()
+    train_diff_for_train = StreamDiff()
+    train_diff_for_scores = StreamDiff()
+    test_diff_calculator = StreamDiff()
+
+    # 评分平滑器（仅用于测试阶段）
+    score_smoother = StreamScoreSmoother(window=smoothing_window)
+
+    # 可选：标准化（在“原始特征 + 差分特征”的联合空间上拟合）
     scaler = None
     if config.STANDARDIZE:
         scaler = StandardScaler()
         for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
-            X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+            X_df, _, _ = utils.split_X_y(
+                chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
+            )
             X_df = train_imputer.transform(X_df)
-            X = X_df.to_numpy(dtype=np.float32, copy=False)
+            X_diff_df = train_diff_for_scaler.transform(X_df)
+            X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
+            X = X_combined_df.to_numpy(dtype=np.float32, copy=False)
             scaler.partial_fit(X)
 
-    # 1) 训练 KMeans（无监督：不使用 label）
+    # 1) 训练 KMeans（无监督：不使用 label），在“原始特征 + 差分特征”空间上拟合
     km = MiniBatchKMeans(
         n_clusters=n_clusters,
         batch_size=batch_size,
@@ -72,9 +159,13 @@ def main() -> None:
     vis_train_take = config.VIS_SAMPLE_SIZE
 
     for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
-        X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+        X_df, _, _ = utils.split_X_y(
+            chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
+        )
         X_df = train_imputer.transform(X_df)
-        X = X_df.to_numpy(dtype=np.float32, copy=False)
+        X_diff_df = train_diff_for_train.transform(X_df)
+        X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
+        X = X_combined_df.to_numpy(dtype=np.float32, copy=False)
 
         if scaler is not None:
             X = scaler.transform(X)
@@ -92,9 +183,13 @@ def main() -> None:
     # 2) 基于训练集 score 分布确定阈值（仍然不使用 label）
     train_scores = []
     for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
-        X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+        X_df, _, _ = utils.split_X_y(
+            chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
+        )
         X_df = train_imputer.transform(X_df)
-        X = X_df.to_numpy(dtype=np.float32, copy=False)
+        X_diff_df = train_diff_for_scores.transform(X_df)
+        X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
+        X = X_combined_df.to_numpy(dtype=np.float32, copy=False)
         if scaler is not None:
             X = scaler.transform(X)
         s = utils.compute_min_distance_to_centroids(X, centers)
@@ -135,14 +230,25 @@ def main() -> None:
         w_pre.writerow(["row_id", "score", "y_pred"])
 
         for chunk in utils.iter_csv_chunks(test_path, test_chunksize):
-            X_df, y, has_label = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+            X_df, y, has_label = utils.split_X_y(
+                chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
+            )
             X_df = test_imputer.transform(X_df)
-            X = X_df.to_numpy(dtype=np.float32, copy=False)
+
+            # 流式差分特征，与 DBSCAN 逻辑一致
+            X_diff_df = test_diff_calculator.transform(X_df)
+            X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
+
+            X = X_combined_df.to_numpy(dtype=np.float32, copy=False)
 
             if scaler is not None:
                 X = scaler.transform(X)
 
             scores = utils.compute_min_distance_to_centroids(X, centers)
+
+            # 分窗平滑异常评分，降低瞬时抖动
+            scores = score_smoother.transform(scores)
+
             y_pred = (scores > threshold).astype(np.int8)
 
             # 保存结果（全量）
@@ -187,6 +293,7 @@ def main() -> None:
             "train_dataset": config.TRAIN_DATASET,
             "test_dataset": config.TEST_DATASET,
             "has_label": True,
+            "smoothing_window": smoothing_window,
         }
     else:
         metrics = {
@@ -200,6 +307,7 @@ def main() -> None:
             "train_dataset": config.TRAIN_DATASET,
             "test_dataset": config.TEST_DATASET,
             "has_label": False,
+            "smoothing_window": smoothing_window,
         }
 
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -220,6 +328,8 @@ def main() -> None:
         "random_state": random_state,
         "threshold_quantile": q,
         "threshold": threshold,
+        "use_diff_features": True,
+        "smoothing_window": smoothing_window,
     }
     with open(model_info_path, "w", encoding="utf-8") as f:
         json.dump(model_info, f, ensure_ascii=False, indent=2)

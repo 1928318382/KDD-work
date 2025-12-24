@@ -1,12 +1,13 @@
 {
-  "accuracy": 0.977131465979154,
-  "precision": 0.7191796076208216,
-  "recall": 0.6503176433972282,
-  "f1": 0.6830173441525977,
-  "threshold": 7.001434326171875,
-  "threshold_quantile": 0.99,
-  "n_clusters": 20,
+  "accuracy": 0.9788197283936745,
+  "precision": 0.7590732095604845,
+  "recall": 0.6459786528990681,
+  "f1": 0.6979743630321253,
+  "threshold": 7.7366470985412565,
+  "threshold_quantile": 0.992,
+  "n_clusters": 12,
   "train_dataset": "normal",
-  "test_dataset": "all",
-  "has_label": true
+  "test_dataset": "merged",
+  "has_label": true,
+  "smoothing_window": 10
 }

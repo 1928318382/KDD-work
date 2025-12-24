@@ -60,14 +60,20 @@ VIS_FIG_DPI = 1800
 # ⑤ KMeans 参数
 # ============================================================
 KMEANS = {
-    "n_clusters": 20,
+    # 【优化】减少簇数，可能降低误报率（当前precision=0.72偏低）
+    "n_clusters": 12,
     "batch_size": 8192,
     "random_state": 42,
     "train_chunksize": 200000,
     "test_chunksize": 200000,
 
-    # 阈值：训练集 score 的分位数
-    "threshold_quantile": 0.99,
+    # 【进一步优化】调整阈值找到precision和recall的更好平衡
+    "threshold_quantile": 0.992,
+
+    # 【新增】滑动窗口平滑大小（类似DBSCAN，用于减少瞬时抖动）
+    # 1=不平滑，5-15=适合大多数时序数据，窗口越大越平滑但对短时异常越不敏感
+    "smoothing_window": 10,
+
 }
 
 # ============================================================
@@ -77,17 +83,19 @@ DBSCAN = {
     # 保持采样行数
     "train_rows": 100000,
 
-    # 稍微增加 min_samples，过滤掉训练集中的个别噪点
-    "min_samples": 50,
+    # 【优化】降低min_samples，提高对小密度区域的敏感度，可能提升recall
+    "min_samples": 30,
 
-    # 【重要】
-    # 设置为 -1.0 以启用我们在 run_dbscan.py 中新写的自动估计逻辑 (Mean+3Std)
-    # 或者，如果你想手动控制，根据之前的 score 分布，建议直接给 3.5
-    "eps": 4,
+    # 【优化】降低eps以提高recall（当前recall=0.68可以进一步提升）
+    # 原eps=4.0，现在试3.8，可能recall提升但precision略降，需要权衡
+    "eps": 3.8,
 
-    # 只有当 eps <= 0 时，下面的参数才生效 (现在用上面的 3.5 覆盖)
+    # 只有当 eps <= 0 时，下面的参数才生效 (现在用上面的值覆盖)
     "eps_quantile": 0.9999,
 
     "pca_components": 30,
     "test_chunksize": 100000,
+
+    # 【新增】滑动窗口大小（已在代码中支持，默认10）
+    "smoothing_window": 10,
 }

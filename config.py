@@ -18,7 +18,7 @@ DATA_FILES = {
 TRAIN_DATASET = "normal"   # 可改成 "all"
 
 # 测试/评估使用哪个数据集：一般用 "merged" 或 "all"
-TEST_DATASET = "all"
+TEST_DATASET = "merged"
 
 # 标签列名（如果没有这一列，会尝试把“最后一列”当作 label）
 LABEL_COL = "label"
@@ -83,11 +83,11 @@ DBSCAN = {
     # 【重要】
     # 设置为 -1.0 以启用我们在 run_dbscan.py 中新写的自动估计逻辑 (Mean+3Std)
     # 或者，如果你想手动控制，根据之前的 score 分布，建议直接给 3.5
-    "eps": 3.5,
+    "eps": 4,
 
     # 只有当 eps <= 0 时，下面的参数才生效 (现在用上面的 3.5 覆盖)
     "eps_quantile": 0.9999,
 
-    "pca_components": 15,
+    "pca_components": 30,
     "test_chunksize": 100000,
 }

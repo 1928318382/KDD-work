@@ -21,6 +21,80 @@ import utils
 import visualization as vis
 
 
+def tune_eps(
+    eps_list: list[float],
+    tune_rows: int,
+    test_path: Path,
+    test_chunksize: int,
+    smoothing_window: int,
+    scaler,
+    pca,
+    core_nn,
+) -> tuple[float | None, dict]:
+    """
+    在测试集前 tune_rows 行上评估多个 eps 候选，选 F1 最优的 eps。
+    若无标签或 tune_rows<=0，返回 (None, {}).
+    """
+    if tune_rows <= 0 or not eps_list:
+        return None, {}
+
+    diff_calc = utils.StreamDiff()
+    smoother = utils.StreamScoreSmoother(window=smoothing_window)
+    imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
+
+    confusions = [utils.Confusion() for _ in eps_list]
+    rows_seen = 0
+    has_label_any = False
+
+    for chunk in utils.iter_csv_chunks(test_path, test_chunksize):
+        if rows_seen >= tune_rows:
+            break
+        remain = tune_rows - rows_seen
+        if remain < len(chunk):
+            chunk = chunk.iloc[:remain]
+
+        X_df, y, has_label = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+        if not has_label or y is None:
+            continue
+        has_label_any = True
+
+        X_df = imputer.transform(X_df)
+        X_diff_df = diff_calc.transform(X_df)
+        X_df_combined = pd.concat([X_df, X_diff_df], axis=1)
+        X = X_df_combined.to_numpy(dtype=np.float32, copy=False)
+        if scaler is not None:
+            X = scaler.transform(X)
+        if pca is not None:
+            X = pca.transform(X)
+
+        dists, _ = core_nn.kneighbors(X, return_distance=True)
+        scores = dists[:, 0].astype(np.float32, copy=False)
+        scores = smoother.transform(scores)
+        y_true = (y == 1).astype(np.int8)
+
+        for idx, eps_c in enumerate(eps_list):
+            y_pred = (scores > eps_c).astype(np.int8)
+            confusions[idx].update(y_true, y_pred)
+
+        rows_seen += len(X_df)
+
+    if not has_label_any:
+        return None, {}
+
+    best_eps = None
+    best_f1 = -1.0
+    tune_report = {}
+    for eps_c, c in zip(eps_list, confusions):
+        m = utils.metrics_from_confusion(c)
+        tune_report[float(eps_c)] = m
+        f1 = m.get("f1")
+        if f1 is not None and f1 > best_f1:
+            best_f1 = f1
+            best_eps = float(eps_c)
+
+    return best_eps, tune_report
+
+
 # ============================================================
 # 1. 流式差分计算器 (用于处理分块读取的测试集)
 # ============================================================
@@ -136,35 +210,55 @@ def main() -> None:
     test_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
 
     # 初始化工具
-    test_diff_calculator = StreamDiff()
-    test_score_smoother = StreamScoreSmoother(window=smoothing_window)
+    test_diff_calculator = utils.StreamDiff()
+    test_score_smoother = utils.StreamScoreSmoother(window=smoothing_window)
 
     # ==================================================
     # 1) 训练数据读取与特征工程
     # ==================================================
-    print(f"正在读取训练数据: {train_path} ...")
-    df_full = pd.read_csv(train_path)
+    if train_rows <= 0:
+        raise ValueError("DBSCAN.train_rows 必须是正整数（DBSCAN 不适合直接全量训练超大 CSV）")
 
-    print("正在计算训练集差分特征...")
-    X_full_df, y_full, _ = utils.split_X_y(df_full, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
-    X_full_df = train_imputer.transform(X_full_df)
+    print(f"正在读取训练数据并随机采样: {train_path} (n={train_rows}) ...")
+    train_chunksize = int(db_cfg.get("train_chunksize", test_chunksize))
 
-    # 差分特征
-    X_diff_df = X_full_df.diff().fillna(0)
-    X_diff_df.columns = [f"{c}_diff" for c in X_full_df.columns]
-    X_combined_df = pd.concat([X_full_df, X_diff_df], axis=1)
+    # 用“随机 key 取最小 k 个”的方式做流式无放回均匀抽样，避免只取前 N 行导致分布偏置
+    train_diff_calculator = utils.StreamDiff()
+    rng = np.random.default_rng(42)
+    keys_res: np.ndarray | None = None
+    X_res: np.ndarray | None = None
 
-    print(f"特征扩展: {X_full_df.shape[1]} -> {X_combined_df.shape[1]}")
+    for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
+        X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+        X_df = train_imputer.transform(X_df)
 
-    # 随机采样
-    if 0 < train_rows < len(X_combined_df):
-        print(f"随机采样 (n={train_rows})...")
-        X_train_df = X_combined_df.sample(n=train_rows, random_state=42)
-    else:
-        X_train_df = X_combined_df
+        X_diff_df = train_diff_calculator.transform(X_df)
+        X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
+        X_chunk = X_combined_df.to_numpy(dtype=np.float32, copy=False)
 
-    X_train = X_train_df.to_numpy(dtype=np.float32, copy=False)
-    del df_full, X_full_df, X_diff_df, X_combined_df
+        keys_chunk = rng.random(X_chunk.shape[0], dtype=np.float64)
+
+        if X_res is None:
+            X_res = X_chunk
+            keys_res = keys_chunk
+        else:
+            assert keys_res is not None
+            threshold = float(np.max(keys_res)) if keys_res.size >= train_rows else 1.0
+            mask = keys_chunk < threshold
+            if np.any(mask):
+                X_res = np.concatenate([X_res, X_chunk[mask]], axis=0)
+                keys_res = np.concatenate([keys_res, keys_chunk[mask]], axis=0)
+
+        assert X_res is not None and keys_res is not None
+        if keys_res.size > train_rows:
+            keep_idx = np.argpartition(keys_res, train_rows - 1)[:train_rows]
+            X_res = X_res[keep_idx]
+            keys_res = keys_res[keep_idx]
+
+    if X_res is None or X_res.shape[0] == 0:
+        raise RuntimeError("训练数据为空：请检查 CSV、以及 label 列配置")
+
+    X_train = X_res
 
     # 标准化 & PCA
     scaler = None
@@ -198,6 +292,31 @@ def main() -> None:
     # 建立索引
     core_nn = NearestNeighbors(n_neighbors=1, algorithm="auto")
     core_nn.fit(core_X)
+
+    # 自动微调 eps：用测试集前 tune_rows 行的带 label 数据选 F1 最优的 eps
+    tune_eps_list = [float(x) for x in db_cfg.get("tune_eps_list", []) if float(x) > 0]
+    tune_rows = int(db_cfg.get("tune_rows", 0))
+    best_eps = None
+    tune_report = {}
+    if tune_rows > 0 and len(tune_eps_list) > 0:
+        # 把当前 eps 也加入候选，避免被覆盖
+        tune_eps_list.append(eps)
+        tune_eps_list = sorted(set(tune_eps_list))
+        best_eps, tune_report = tune_eps(
+            eps_list=tune_eps_list,
+            tune_rows=tune_rows,
+            test_path=test_path,
+            test_chunksize=test_chunksize,
+            smoothing_window=smoothing_window,
+            scaler=scaler,
+            pca=pca,
+            core_nn=core_nn,
+        )
+        if best_eps is not None:
+            eps = best_eps
+            print(f"[AutoTune] choose eps={eps:.4f} (tune_rows={tune_rows})")
+        else:
+            print("[AutoTune] skipped (no label found或tune_rows<=0)")
 
     # 输出路径
     results_path = out_dir / "dbscan_results.csv"
@@ -244,6 +363,7 @@ def main() -> None:
 
             y_pred = (scores > eps).astype(np.int8)
 
+            chunk_start_row_id = row_id
             if config.SAVE_FULL_RESULTS:
                 for s, yp in zip(scores, y_pred):
                     w_res.writerow([row_id, float(s), int(yp)])
@@ -254,8 +374,7 @@ def main() -> None:
             if preview_written < preview_rows:
                 take = min(preview_rows - preview_written, X.shape[0])
                 for i in range(take):
-                    w_pre.writerow([row_id - X.shape[0] + i if not config.SAVE_FULL_RESULTS else row_id - take + i,
-                                    float(scores[i]), int(y_pred[i])])
+                    w_pre.writerow([chunk_start_row_id + i, float(scores[i]), int(y_pred[i])])
                 preview_written += take
 
             if has_label and y is not None:
@@ -280,12 +399,33 @@ def main() -> None:
         "n_core_samples": int(len(core_X)),
         "n_clusters_found": int(n_clusters),
         "test_dataset": config.TEST_DATASET,
+        "auto_tune_used": best_eps is not None,
+        "tune_rows": tune_rows,
     })
 
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     with open(confusion_path, "w", encoding="utf-8") as f:
         json.dump(confusion.to_dict(), f, ensure_ascii=False, indent=2)
+
+    model_info = {
+        "method": "dbscan_nearest_core_diff",
+        "train_path": str(train_path),
+        "test_path": str(test_path),
+        "impute_strategy": config.IMPUTE_STRATEGY,
+        "constant_value": config.CONSTANT_VALUE,
+        "standardize": config.STANDARDIZE,
+        "train_rows": train_rows,
+        "min_samples": min_samples,
+        "eps": eps,
+        "eps_quantile": eps_quantile,
+        "pca_components": pca_components,
+        "smoothing_window": smoothing_window,
+        "auto_tune_used": best_eps is not None,
+        "tune_rows": tune_rows,
+    }
+    with open(model_info_path, "w", encoding="utf-8") as f:
+        json.dump(model_info, f, ensure_ascii=False, indent=2)
 
     # 绘图（省略部分细节以保持代码精简，逻辑同前）
     if config.ENABLE_VIS:

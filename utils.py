@@ -9,6 +9,77 @@ import numpy as np
 import pandas as pd
 
 
+class StreamDiff:
+    """
+    计算块内 diff 特征，并在 chunk 边界处用上一块最后一行补齐第一行的 diff。
+    用于大 CSV 分块读取的时序特征工程。
+    """
+
+    def __init__(self) -> None:
+        self._prev_row: Optional[pd.Series] = None
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=[f"{c}_diff" for c in df.columns], index=df.index)
+
+        diff_df = df.diff()
+
+        if self._prev_row is not None:
+            first_row_diff = df.iloc[0].values - self._prev_row.values
+            diff_df.iloc[0] = first_row_diff
+        else:
+            diff_df.iloc[0] = 0.0
+
+        self._prev_row = df.iloc[-1].copy()
+        diff_df.columns = [f"{c}_diff" for c in df.columns]
+        return diff_df
+
+
+class StreamScoreSmoother:
+    """
+    流式滚动均值平滑（Moving Average），支持 chunk 之间连续平滑。
+    - window<=1: 不平滑
+    - min_periods=1: 起始处用已有样本数做均值
+    """
+
+    def __init__(self, window: int = 10):
+        self.window = int(window)
+        self._buffer = np.array([], dtype=np.float32)
+
+    def transform(self, scores: np.ndarray) -> np.ndarray:
+        scores = np.asarray(scores, dtype=np.float32)
+        if self.window <= 1 or scores.size == 0:
+            return scores
+
+        if self._buffer.size:
+            data = np.concatenate([self._buffer, scores]).astype(np.float32, copy=False)
+        else:
+            data = scores
+
+        n = int(data.size)
+        w = int(self.window)
+
+        # rolling mean with min_periods=1 via cumulative sum
+        csum = np.cumsum(data, dtype=np.float64)
+        idx = np.arange(n, dtype=np.int64)
+        start = idx - (w - 1)
+        start = np.maximum(start, 0)
+
+        prev = np.zeros(n, dtype=np.float64)
+        mask = start > 0
+        prev[mask] = csum[start[mask] - 1]
+
+        window_sum = csum - prev
+        denom = (idx - start + 1).astype(np.float64)
+        smoothed = (window_sum / denom).astype(np.float32)
+
+        result = smoothed[-scores.size:]
+
+        keep = min(w, n)
+        self._buffer = data[-keep:].astype(np.float32, copy=True)
+        return result
+
+
 @dataclass
 class Confusion:
     tp: int = 0

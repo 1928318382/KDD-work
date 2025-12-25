@@ -1,0 +1,17 @@
+{
+  "method": "kmeans_distance",
+  "train_path": "data\\swat_clean_normal.csv",
+  "test_path": "data\\swat_clean_merged.csv",
+  "impute_strategy": "ffill_bfill",
+  "constant_value": -1.0,
+  "standardize": false,
+  "n_clusters": 12,
+  "batch_size": 8192,
+  "random_state": 42,
+  "threshold_quantile": 0.992,
+  "threshold": 7.02078744411469,
+  "use_diff_features": true,
+  "smoothing_window": 10,
+  "auto_tune_used": true,
+  "tune_rows": 150000
+}

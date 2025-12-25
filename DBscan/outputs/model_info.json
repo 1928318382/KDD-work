@@ -1,0 +1,16 @@
+{
+  "method": "dbscan_nearest_core_diff",
+  "train_path": "data\\swat_clean_normal.csv",
+  "test_path": "data\\swat_clean_merged.csv",
+  "impute_strategy": "ffill_bfill",
+  "constant_value": -1.0,
+  "standardize": false,
+  "train_rows": 100000,
+  "min_samples": 50,
+  "eps": 3.6,
+  "eps_quantile": 0.9999,
+  "pca_components": 30,
+  "smoothing_window": 10,
+  "auto_tune_used": true,
+  "tune_rows": 100000
+}

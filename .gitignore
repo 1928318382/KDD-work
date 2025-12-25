@@ -8,10 +8,7 @@ venv/
 .env/
 
 # 数据文件
-*.csv
-*.xlsx
-*.zip
-*.json
+data/
 # 运行日志
 *.log
 

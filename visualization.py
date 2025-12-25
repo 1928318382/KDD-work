@@ -7,7 +7,6 @@ from typing import Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
 
 plt.rcParams['font.sans-serif'] = ['SimHei']   # 黑体，Windows 自带
 plt.rcParams['axes.unicode_minus'] = False     # 解决负号显示问题

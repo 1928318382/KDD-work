@@ -20,53 +20,124 @@ import utils
 import visualization as vis
 
 
-class StreamDiff:
+def tune_thresholds(
+    threshold_candidates: list[float],
+    tune_rows: int,
+    test_path: Path,
+    test_chunksize: int,
+    smoothing_window: int,
+    scaler,
+    centers: np.ndarray,
+) -> tuple[float | None, dict]:
     """
-    参照 DBSCAN 脚本，实现跨分块的一阶差分特征。
-    - 训练和测试都可以用该类来在流式读取时构造 diff 特征。
+    用测试集前 tune_rows 行的带标签数据评估多个阈值候选，选 F1 最优的阈值。
+    若无标签或 tune_rows<=0，返回 (None, {}).
     """
+    if tune_rows <= 0:
+        return None, {}
 
-    def __init__(self) -> None:
+    diff_calc = utils.StreamDiff()
+    smoother = utils.StreamScoreSmoother(window=smoothing_window)
+    imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
+
+    confusions = [utils.Confusion() for _ in threshold_candidates]
+    rows_seen = 0
+    has_label_any = False
+
+    for chunk in utils.iter_csv_chunks(test_path, test_chunksize):
+        if rows_seen >= tune_rows:
+            break
+        remain = tune_rows - rows_seen
+        if remain < len(chunk):
+            chunk = chunk.iloc[:remain]
+
+        X_df, y, has_label = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
+        if not has_label or y is None:
+            continue
+        has_label_any = True
+
+        X_df = imputer.transform(X_df)
+        X_diff_df = diff_calc.transform(X_df)
+        X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
+        X = X_combined_df.to_numpy(dtype=np.float32, copy=False)
+        if scaler is not None:
+            X = scaler.transform(X)
+
+        scores = utils.compute_min_distance_to_centroids(X, centers)
+        scores = smoother.transform(scores)
+        y_true = (y == 1).astype(np.int8)
+
+        for idx, thr in enumerate(threshold_candidates):
+            y_pred = (scores > thr).astype(np.int8)
+            confusions[idx].update(y_true, y_pred)
+
+        rows_seen += len(X_df)
+
+    if not has_label_any:
+        return None, {}
+
+    best_thr = None
+    best_f1 = -1.0
+    tune_report = {}
+    for thr, c in zip(threshold_candidates, confusions):
+        m = utils.metrics_from_confusion(c)
+        tune_report[float(thr)] = m
+        f1 = m.get("f1")
+        if f1 is not None and f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr)
+
+    return best_thr, tune_report
+
+
+# ============================================================
+# 1. 流式差分计算器 (用于处理分块读取的测试集)
+# ============================================================
+class StreamDiff:
+    def __init__(self):
         self._prev_row = None  # 记录上一块的最后一行
 
-    def transform(self, df: "pd.DataFrame") -> "pd.DataFrame":
+    def transform(self, df):
+        """
+        计算当前块的差分特征。
+        """
         if df.empty:
-            return pd.DataFrame(
-                columns=[f"{c}_diff" for c in df.columns],
-                index=df.index,
-            )
+            return df.copy()
 
-        # 块内差分
+        # 1. 计算当前块内部的 diff
         diff_df = df.diff()
 
-        # 第一行与上一块最后一行对齐，保证跨块连续
+        # 2. 处理第一行的边界接缝
         if self._prev_row is not None:
             first_row_diff = df.iloc[0].values - self._prev_row.values
             diff_df.iloc[0] = first_row_diff
         else:
             diff_df.iloc[0] = 0.0
 
-        # 更新缓存行
+        # 3. 更新 prev_row 供下一块使用
         self._prev_row = df.iloc[-1].copy()
 
+        # 4. 重命名列
         diff_df.columns = [f"{c}_diff" for c in df.columns]
         return diff_df
 
 
+# ============================================================
+# 2. 流式评分平滑器 (算法优化核心)
+# ============================================================
 class StreamScoreSmoother:
-    """
-    参照 DBSCAN 脚本的滑动窗口平滑，对异常评分做时间窗口平均，
-    降低瞬时抖动带来的误报。
-    """
-
-    def __init__(self, window: int = 1) -> None:
-        self.window = int(window)
+    def __init__(self, window: int = 10):
+        self.window = window
         self._buffer = np.array([], dtype=np.float32)
 
     def transform(self, scores: np.ndarray) -> np.ndarray:
+        """
+        对异常评分进行滑动窗口平均 (Moving Average)
+        """
         if self.window <= 1:
             return scores
 
+        # 拼接上一块的尾部数据，保证平滑的连续性
         if len(self._buffer) > 0:
             data = np.concatenate([self._buffer, scores])
         else:
@@ -75,17 +146,14 @@ class StreamScoreSmoother:
         if len(data) == 0:
             return scores
 
-        smoothed = (
-            pd.Series(data)
-            .rolling(window=self.window, min_periods=1)
-            .mean()
-            .to_numpy(dtype=np.float32)
-        )
+        # 使用 Pandas 的 rolling mean 进行平滑
+        # min_periods=1 保证数据不足窗口大小时也能计算（主要针对开头）
+        smoothed = pd.Series(data).rolling(window=self.window, min_periods=1).mean().to_numpy(dtype=np.float32)
 
-        # 只返回当前块对应的那一段
-        result = smoothed[-len(scores) :]
+        # 只取当前块对应的结果部分
+        result = smoothed[-len(scores):]
 
-        # 更新 buffer，保留末尾 window 个点
+        # 更新 buffer，保留末尾 (window) 个数据供下一块使用
         keep = min(self.window, len(data))
         self._buffer = data[-keep:]
 
@@ -124,29 +192,27 @@ def main() -> None:
     test_imputer = utils.StreamImputer(config.IMPUTE_STRATEGY, config.CONSTANT_VALUE)
 
     # 差分特征计算器（训练/测试各一套）
-    train_diff_for_scaler = StreamDiff()
-    train_diff_for_train = StreamDiff()
-    train_diff_for_scores = StreamDiff()
-    test_diff_calculator = StreamDiff()
+    train_diff_for_scaler = utils.StreamDiff()
+    train_diff_for_train = utils.StreamDiff()
+    train_diff_for_scores = utils.StreamDiff()
+    test_diff_calculator = utils.StreamDiff()
 
     # 评分平滑器（仅用于测试阶段）
-    score_smoother = StreamScoreSmoother(window=smoothing_window)
+    score_smoother = utils.StreamScoreSmoother(window=smoothing_window)
 
-    # 可选：标准化（在“原始特征 + 差分特征”的联合空间上拟合）
+    # 可选：标准化 (在差分特征空间上)
     scaler = None
     if config.STANDARDIZE:
         scaler = StandardScaler()
         for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
-            X_df, _, _ = utils.split_X_y(
-                chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
-            )
+            X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
             X_df = train_imputer.transform(X_df)
             X_diff_df = train_diff_for_scaler.transform(X_df)
             X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
             X = X_combined_df.to_numpy(dtype=np.float32, copy=False)
             scaler.partial_fit(X)
 
-    # 1) 训练 KMeans（无监督：不使用 label），在“原始特征 + 差分特征”空间上拟合
+    # 1) 训练 KMeans（无监督：不使用 label）
     km = MiniBatchKMeans(
         n_clusters=n_clusters,
         batch_size=batch_size,
@@ -159,9 +225,7 @@ def main() -> None:
     vis_train_take = config.VIS_SAMPLE_SIZE
 
     for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
-        X_df, _, _ = utils.split_X_y(
-            chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
-        )
+        X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
         X_df = train_imputer.transform(X_df)
         X_diff_df = train_diff_for_train.transform(X_df)
         X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
@@ -183,9 +247,7 @@ def main() -> None:
     # 2) 基于训练集 score 分布确定阈值（仍然不使用 label）
     train_scores = []
     for chunk in utils.iter_csv_chunks(train_path, train_chunksize):
-        X_df, _, _ = utils.split_X_y(
-            chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
-        )
+        X_df, _, _ = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
         X_df = train_imputer.transform(X_df)
         X_diff_df = train_diff_for_scores.transform(X_df)
         X_combined_df = pd.concat([X_df, X_diff_df], axis=1)
@@ -200,6 +262,33 @@ def main() -> None:
         raise RuntimeError("训练集 score 为空，检查数据是否正确读取。")
 
     threshold = float(np.quantile(train_scores_all, q))
+
+    # 自动微调阈值（需 label）：在测试集前 tune_rows 行上评估多个分位数对应的阈值
+    tune_rows = int(km_cfg.get("tune_rows", 0))
+    tune_quantiles = km_cfg.get("tune_quantiles") or []
+    tune_candidates = [threshold]
+    for tq in tune_quantiles:
+        if 0 < float(tq) < 1:
+            tune_candidates.append(float(np.quantile(train_scores_all, float(tq))))
+    tune_candidates = sorted(set(tune_candidates))
+
+    best_thr = None
+    tune_report = {}
+    if tune_rows > 0 and len(tune_candidates) > 1:
+        best_thr, tune_report = tune_thresholds(
+            threshold_candidates=tune_candidates,
+            tune_rows=tune_rows,
+            test_path=test_path,
+            test_chunksize=test_chunksize,
+            smoothing_window=smoothing_window,
+            scaler=scaler,
+            centers=centers,
+        )
+        if best_thr is not None:
+            threshold = best_thr
+            print(f"[AutoTune] choose threshold={threshold:.4f} (tune_rows={tune_rows})")
+        else:
+            print("[AutoTune] skipped (no label found or tune_rows<=0)")
 
     # 3) 在测试集上输出 score / y_pred，并用 label（若存在）做评估
     results_path = out_dir / "kmeans_results.csv"
@@ -230,9 +319,7 @@ def main() -> None:
         w_pre.writerow(["row_id", "score", "y_pred"])
 
         for chunk in utils.iter_csv_chunks(test_path, test_chunksize):
-            X_df, y, has_label = utils.split_X_y(
-                chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL
-            )
+            X_df, y, has_label = utils.split_X_y(chunk, config.LABEL_COL, config.ASSUME_LAST_COL_AS_LABEL)
             X_df = test_imputer.transform(X_df)
 
             # 流式差分特征，与 DBSCAN 逻辑一致
@@ -294,6 +381,8 @@ def main() -> None:
             "test_dataset": config.TEST_DATASET,
             "has_label": True,
             "smoothing_window": smoothing_window,
+            "auto_tune_used": best_thr is not None,
+            "tune_rows": tune_rows,
         }
     else:
         metrics = {
@@ -308,6 +397,8 @@ def main() -> None:
             "test_dataset": config.TEST_DATASET,
             "has_label": False,
             "smoothing_window": smoothing_window,
+            "auto_tune_used": False,
+            "tune_rows": tune_rows,
         }
 
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -330,6 +421,8 @@ def main() -> None:
         "threshold": threshold,
         "use_diff_features": True,
         "smoothing_window": smoothing_window,
+        "auto_tune_used": best_thr is not None,
+        "tune_rows": tune_rows,
     }
     with open(model_info_path, "w", encoding="utf-8") as f:
         json.dump(model_info, f, ensure_ascii=False, indent=2)

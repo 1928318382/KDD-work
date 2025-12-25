@@ -1,0 +1,15 @@
+{
+  "accuracy": 0.9868053344653154,
+  "precision": 0.9549846625766871,
+  "recall": 0.6839677047289504,
+  "f1": 0.7970685185777834,
+  "eps": 3.6,
+  "min_samples": 50,
+  "pca_components": 30,
+  "smoothing_window": 10,
+  "n_core_samples": 99611,
+  "n_clusters_found": 3,
+  "test_dataset": "merged",
+  "auto_tune_used": true,
+  "tune_rows": 100000
+}
